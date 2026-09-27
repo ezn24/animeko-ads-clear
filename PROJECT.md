@@ -23,7 +23,7 @@
 
 桌面套件沒有開發者憑證簽署或公證。iOS 產生需自行簽署安裝的 IPA；workflow 不接觸 Apple 私鑰，也不會自動上傳 App Store／TestFlight。
 
-iOS 使用上游所需的 12g／20g JVM 設定，Pod 與 IPA 任務自動重試。由於 GitHub 標準 macOS runner 的 Kotlin/Native linking 資源可能不足，iOS 為實驗性矩陣項目；其失敗不阻斷 Android 簽章及其他平台發佈，Release 可在缺少 iOS artifact 時完成。
+iOS 使用上游所需的 12g／20g JVM 設定。建構時先由 Gradle 產生 podspec 與 CocoaPods 所需的 dummy framework，再更新 Info.plist 並依上游文件直接執行 `pod install`；若首次安裝失敗，使用 `pod install --repo-update` 更新規格庫後重試。IPA 任務保留自動重試。由於 GitHub 標準 macOS runner 的 Kotlin/Native linking 資源可能不足，iOS 為實驗性矩陣項目；其失敗不阻斷 Android 簽章及其他平台發佈，Release 可在缺少 iOS artifact 時完成。
 
 ## 操作
 
@@ -74,7 +74,7 @@ PowerShell 取得檔案的 Base64（自行將結果貼到 GitHub Secret，勿貼
 
 ## 驗證狀態
 
-目前以官方 v6.2.0 作為適配基準。2026-09-28 的首次全平台 run 已成功產出 Android、Windows x86_64／ARM64、macOS Apple Silicon／Intel 與 Linux artifacts；iOS 在 release linking 失敗後，已依上游設定提高 JVM 記憶體並加入重試。各平台 UI 與播放功能仍需實機驗證。Android 手機 debug APK 已由本地獨立編譯，不以 CI 產物替代。
+目前以官方 v6.2.0 作為適配基準。2026-09-28 的全平台 run 已成功產出 Android、Windows x86_64／ARM64、macOS Apple Silicon／Intel 與 Linux artifacts。完整 iOS log 顯示 `application.podspec` 因缺少 Kotlin dummy framework 而拒絕載入，現已在 `pod install` 前執行 `:app:shared:application:generateDummyFramework`。Android 簽章改用 Android SDK build-tools 內的絕對路徑；後續 Android run 在 `packageDefaultRelease` 的 Zipflinger 階段耗盡 4 GiB Gradle heap，現提高至 6 GiB、限制單一 worker，並依序建構手機與 TV。首次 publish 因 job 沒有 `.git` 且 `gh release create` 未指定 repository 而失敗，現已明確傳入 `GITHUB_REPOSITORY`。各平台 UI 與播放功能仍需實機驗證。Android 手機 debug APK 已由本地獨立編譯，不以 CI 產物替代。
 
 ## 儲存庫維護
 

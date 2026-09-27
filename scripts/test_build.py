@@ -30,6 +30,30 @@ class BuildTests(unittest.TestCase):
             build.gradle_retry(':task', attempts=2)
         self.assertEqual(gradle.call_count, 2)
 
+    def test_ios_pods_use_direct_install_and_repo_update_fallback(self):
+        failure = build.subprocess.CalledProcessError(1, ['pod', 'install'])
+        with patch.object(build, 'gradle_retry') as gradle, \
+                patch.object(build, 'run', side_effect=[failure, None]) as run:
+            build.install_ios_pods()
+        self.assertEqual(gradle.call_args_list, [
+            unittest.mock.call(':app:shared:application:podspec', attempts=2),
+            unittest.mock.call(':app:shared:application:generateDummyFramework', attempts=2),
+            unittest.mock.call(':app:ios:patchInfoPlist', attempts=2),
+        ])
+        self.assertEqual(run.call_args_list, [
+            unittest.mock.call('pod', 'install', cwd=build.SRC/'app/ios'),
+            unittest.mock.call('pod', 'install', '--repo-update', cwd=build.SRC/'app/ios'),
+        ])
+
+    def test_android_phone_and_tv_build_sequentially(self):
+        with patch.dict(os.environ, {'TARGET': 'android', 'BUILD_TYPE': 'release'}), \
+                patch.object(build, 'gradle') as gradle:
+            build.build()
+        self.assertEqual(gradle.call_args_list, [
+            unittest.mock.call(':app:android:assembleDefaultRelease'),
+            unittest.mock.call(':app:android:assembleTvRelease'),
+        ])
+
     def test_android_collection_preserves_flavor_and_abi(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1,4 +1,5 @@
 name: noad multiplatform
+run-name: noad ${{ inputs.tag || 'latest' }} (${{ github.event_name }})
 
 on:
   push:
@@ -150,15 +151,18 @@ jobs:
           for name in KEYSTORE_BASE64 KS_PASS KEY_ALIAS KEY_PASS; do
             if [ -z "${!name:-}" ]; then echo "Missing required Android signing secret: $name" >&2; exit 1; fi
           done
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          apksigner="$sdk_root/build-tools/36.0.0/apksigner"
+          if [ ! -x "$apksigner" ]; then echo "apksigner not found at $apksigner" >&2; exit 1; fi
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/noad-release.jks"
           chmod 600 "$RUNNER_TEMP/noad-release.jks"
           find signed -name '*.sha256' -delete
           mapfile -d '' apks < <(find signed -name '*.apk' -print0)
           if [ "${#apks[@]}" -eq 0 ]; then echo 'No Android APKs found' >&2; exit 1; fi
           for apk in "${apks[@]}"; do
-            apksigner sign --ks "$RUNNER_TEMP/noad-release.jks" --ks-key-alias "$KEY_ALIAS" \
+            "$apksigner" sign --ks "$RUNNER_TEMP/noad-release.jks" --ks-key-alias "$KEY_ALIAS" \
               --ks-pass env:KS_PASS --key-pass env:KEY_PASS "$apk"
-            apksigner verify --verbose --print-certs "$apk"
+            "$apksigner" verify --verbose --print-certs "$apk"
             (cd "$(dirname "$apk")" && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
           done
       - name: Remove keystore
@@ -218,6 +222,7 @@ jobs:
           mapfile -d '' assets < <(find release-assets -type f -print0)
           if [ "${#assets[@]}" -eq 0 ]; then echo 'No release assets found' >&2; exit 1; fi
           gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Animeko ${UPSTREAM_TAG} no-ad" \
             --notes "Patched build based on open-ani/animeko ${UPSTREAM_TAG}. See README and the attached build metadata, source diffs, and checksums."

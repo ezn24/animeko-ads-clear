@@ -60,12 +60,15 @@ def prepare():
     p = SRC / 'gradle.properties'
     text = p.read_text(encoding='utf-8')
     ios = target == 'ios'
+    android = target == 'android'
     for key, value in {'version.name': version, 'package.version': version.split('-')[0],
                        'ios.version.code': f'{major}.{minor}.{patch * 100 + meta}',
                        'org.gradle.jvmargs': ('-Xmx12g -Dfile.encoding=UTF-8 '
-                                              '-Dkotlin.daemon.jvm.options=-Xmx20g') if ios else '-Xmx4g -Dfile.encoding=UTF-8',
+                                              '-Dkotlin.daemon.jvm.options=-Xmx20g') if ios else
+                                             ('-Xmx6g -Dfile.encoding=UTF-8' if android else
+                                              '-Xmx4g -Dfile.encoding=UTF-8'),
                        'kotlin.daemon.jvmargs': '-Xmx20g' if ios else '-Xmx3g',
-                       'org.gradle.workers.max': '2',
+                       'org.gradle.workers.max': '1' if android else '2',
                        'org.gradle.configuration-cache': 'false'}.items():
         pattern = '^' + re.escape(key) + '=.*$'
         if re.search(pattern, text, re.M):
@@ -149,14 +152,31 @@ def gradle_retry(*tasks, attempts):
             print(f'::warning::Gradle attempt {attempt}/{attempts} failed; retrying {", ".join(tasks)}')
 
 
+def install_ios_pods():
+    # Upstream documents direct `pod install` as the fallback when its Gradle
+    # wrapper fails. Kotlin's generated podspec also requires a dummy framework
+    # before CocoaPods can evaluate it. Run each prerequisite explicitly so
+    # CocoaPods failures are visible, then update specs only for a real retry.
+    gradle_retry(':app:shared:application:podspec', attempts=2)
+    gradle_retry(':app:shared:application:generateDummyFramework', attempts=2)
+    gradle_retry(':app:ios:patchInfoPlist', attempts=2)
+    try:
+        run('pod', 'install', cwd=SRC / 'app/ios')
+    except subprocess.CalledProcessError:
+        print('::warning::pod install failed; retrying with --repo-update')
+        run('pod', 'install', '--repo-update', cwd=SRC / 'app/ios')
+
+
 def build():
     target = os.environ['TARGET']
     if target == 'android':
         mode = os.environ.get('BUILD_TYPE', 'release').capitalize()
-        gradle(':app:android:assembleDefault' + mode, ':app:android:assembleTv' + mode)
+        # Package the phone and TV APK sets separately. Packaging both variants
+        # together can exhaust the Gradle heap while Zipflinger reads native libs.
+        gradle(':app:android:assembleDefault' + mode)
+        gradle(':app:android:assembleTv' + mode)
     elif target == 'ios':
-        gradle_retry(':app:ios:podInstall', attempts=2)
-        gradle_retry(':app:ios:patchInfoPlist', attempts=2)
+        install_ios_pods()
         gradle_retry(':app:ios:buildReleaseIpa', attempts=3)
     elif target == 'macos-aarch64':
         gradle(':app:desktop:packageReleaseDistributionForCurrentOS')
