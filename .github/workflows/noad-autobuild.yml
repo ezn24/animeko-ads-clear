@@ -1,0 +1,224 @@
+name: noad multiplatform
+
+on:
+  push:
+    branches: [noad-ci]
+    paths:
+      - '.github/workflows/noad-autobuild.yml'
+      - 'noad.patch'
+      - 'scripts/**'
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag; empty selects latest stable release'
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noad-multiplatform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      sha: ${{ steps.upstream.outputs.sha }}
+      release_tag: ${{ steps.upstream.outputs.release_tag }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+      should_publish: ${{ steps.upstream.outputs.should_publish }}
+    steps:
+      - id: upstream
+        uses: actions/github-script@v7
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        with:
+          script: |
+            const upstream = {owner: 'open-ani', repo: 'animeko'};
+            const tag = process.env.REQUESTED_TAG || (await github.rest.repos.getLatestRelease(upstream)).data.tag_name;
+            if (!/^v\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$/.test(tag)) throw new Error('Invalid upstream tag');
+            const sha = (await github.rest.repos.getCommit({...upstream, ref: tag})).data.sha;
+            const releaseTag = `${tag}-noad`;
+            let releaseExists = false;
+            try {
+              await github.rest.repos.getReleaseByTag({...context.repo, tag: releaseTag});
+              releaseExists = true;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            core.setOutput('tag', tag);
+            core.setOutput('sha', sha);
+            core.setOutput('release_tag', releaseTag);
+            core.setOutput('should_build', context.eventName === 'workflow_dispatch' || !releaseExists);
+            core.setOutput('should_publish', !releaseExists);
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: android, runner: ubuntu-24.04, jbr: linux-x64, experimental: false}
+          - {target: windows-x86_64, runner: windows-2025, jbr: windows-x64, experimental: false}
+          - {target: windows-aarch64, runner: windows-11-arm, jbr: windows-aarch64, experimental: false}
+          - {target: macos-aarch64, runner: macos-15, jbr: osx-aarch64, experimental: false}
+          - {target: macos-x86_64, runner: macos-15-intel, jbr: osx-x64, experimental: false}
+          - {target: linux-x86_64, runner: ubuntu-24.04, jbr: linux-x64, experimental: false}
+          - {target: ios, runner: macos-15, jbr: osx-aarch64, experimental: true}
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      UPSTREAM_TAG: ${{ needs.resolve.outputs.tag }}
+      BUILD_TYPE: release
+      TARGET: ${{ matrix.target }}
+      JBR_PLATFORM: ${{ matrix.jbr }}
+      IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: open-ani/animeko
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Apply patch and configure build
+        env:
+          DANDANPLAY_APP_ID: ${{ secrets.DANDANPLAY_APP_ID }}
+          DANDANPLAY_APP_SECRET: ${{ secrets.DANDANPLAY_APP_SECRET }}
+        run: python scripts/build.py prepare
+      - name: Install verified JBR 21 with JCEF
+        run: python scripts/build.py jbr
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+      - name: Install Linux packaging dependencies
+        if: matrix.target == 'linux-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y patchelf libfuse2t64
+      - name: Select Xcode and verify CocoaPods
+        if: matrix.target == 'ios'
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          xcodebuild -version
+          pod --version
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+      - name: Build patched packages
+        run: python scripts/build.py build
+      - name: Collect unsigned packages and checksums
+        run: python scripts/build.py collect
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target == 'android' && 'noad-android-unsigned' || format('noad-{0}', matrix.target) }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  sign-android:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-android-unsigned
+          path: signed
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools build-tools;36.0.0'
+      - name: Sign and verify Android APKs
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIGNING_RELEASE_STOREFILE }}
+          KS_PASS: ${{ secrets.SIGNING_RELEASE_STOREPASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_RELEASE_KEYALIAS }}
+          KEY_PASS: ${{ secrets.SIGNING_RELEASE_KEYPASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE_BASE64 KS_PASS KEY_ALIAS KEY_PASS; do
+            if [ -z "${!name:-}" ]; then echo "Missing required Android signing secret: $name" >&2; exit 1; fi
+          done
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/noad-release.jks"
+          chmod 600 "$RUNNER_TEMP/noad-release.jks"
+          find signed -name '*.sha256' -delete
+          mapfile -d '' apks < <(find signed -name '*.apk' -print0)
+          if [ "${#apks[@]}" -eq 0 ]; then echo 'No Android APKs found' >&2; exit 1; fi
+          for apk in "${apks[@]}"; do
+            apksigner sign --ks "$RUNNER_TEMP/noad-release.jks" --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KS_PASS --key-pass env:KEY_PASS "$apk"
+            apksigner verify --verbose --print-certs "$apk"
+            (cd "$(dirname "$apk")" && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
+          done
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/noad-release.jks"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noad-android-signed
+          path: signed/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [resolve, build, sign-android]
+    if: needs.resolve.outputs.should_publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-android-signed
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-windows-x86_64
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-windows-aarch64
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-macos-aarch64
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-macos-x86_64
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: noad-linux-x86_64
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: noad-ios
+          path: release-assets
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          if [ "${#assets[@]}" -eq 0 ]; then echo 'No release assets found' >&2; exit 1; fi
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "Animeko ${UPSTREAM_TAG} no-ad" \
+            --notes "Patched build based on open-ani/animeko ${UPSTREAM_TAG}. See README and the attached build metadata, source diffs, and checksums."
+
